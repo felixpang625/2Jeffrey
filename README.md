@@ -59,11 +59,57 @@ smooth one. Measured on the same duck: **109 tris = abstract mush, ~200 = clearl
 
 | Path | What |
 |---|---|
-| `kat/stylescan.py` | core: mesh load/merge, repeat-pass decimation, texture→face-colour sampling, posterisation, and a numpy z-buffer rasteriser used for previews and thumbnails |
-| `kat/stylescan_uv.py` | the stylisers (`katamari_faceted` / `katamari_vcol` / `katamari_inherit`); CLI |
+| `kat/core/` | **the shipping core**, in C/C++ — see below. Verified against the Python reference. |
+| `kat/stylescan.py` | Python reference: mesh load/merge, decimation, texture→colour sampling, posterisation, and a numpy z-buffer rasteriser used for previews and thumbnails |
+| `kat/stylescan_uv.py` | Python reference stylisers (`katamari_faceted` / `katamari_vcol` / `katamari_inherit`); CLI |
 | `kat/build_library.py` | renders a thumbnail per model and generates the browsable gallery page |
 | `kat/viewer.html` | single-file `<model-viewer>` page — open on any phone to spin a `.glb` |
 | `docs/PLAN.md` | the full iOS build plan, with the measured findings and the pitfalls hit |
+
+---
+
+## The shipping core is C/C++, not Python
+
+Python was the right language to *discover* the algorithm in, but it was never going to
+ship. The styliser now lives in `kat/core/` as portable C/C++:
+
+| File | What |
+|---|---|
+| `kat/core/katamari_core.h` | the interface (`katamari_stylize`) — callable from Swift via a bridging header |
+| `kat/core/katamari_core.cpp` | decimate (meshoptimizer) + per-face colour + k-means posterise |
+| `kat/core/vendor/meshoptimizer.{h,cpp}` | vendored meshoptimizer 1.3 (MIT) |
+| `kat/core/katamari_cli.cpp` | text-format harness so Python can drive the core |
+| `kat/core/test_core.py` | **verification** against the Python reference |
+| `kat/core/core_to_glb.py` | end-to-end: glb → core → `.glb` |
+
+### Why C, and why it's better than the Python path
+
+`meshopt_simplify` collapses edges into **existing** vertices — it never invents new ones.
+So surviving vertices keep their **original UVs**, and colours are sampled directly instead
+of being projected back onto the source. That makes the "black shard" artifact class
+*structurally impossible*, rather than patched around.
+
+Proof over four models, both paths fed the same mesh and per-vertex colours:
+
+| model | source tris | Python oracle | **C core** | palette |
+|---|---|---|---|---|
+| Avocado | 682 | 198 | **199** | 12 |
+| Duck | 4,212 | 199 | **200** | 12 |
+| Water Bottle | 4,510 | 199 | **200** | 12 |
+| BoomBox | 6,036 | 198 | **200** | 12 |
+
+The C core hits the target exactly on every model (meshoptimizer is more reliable at this
+than the Python decimator), and is *cleaner* — the Duck, which shards under the Python
+projection path, comes out coherent.
+
+```bash
+make -C kat/core          # builds in seconds, no Swift or macOS needed
+python3 kat/core/test_core.py                    # verify vs the Python reference
+python3 kat/core/core_to_glb.py kat/src/Duck.glb 200 12 kat/out/Duck_core.glb
+```
+
+Being C means it is testable on any machine (this was developed and verified on Linux),
+reusable server-side, and wrappable from Swift with a two-line bridging header.
 
 ---
 
@@ -105,8 +151,9 @@ See [`docs/PLAN.md`](docs/PLAN.md) for the long form.
 
 ## Roadmap
 
-- [x] Katamari-izer engine (this repo) — faceted default, gallery, phone viewer
-- [ ] iOS capture app: `ObjectCaptureSession` → `PhotogrammetrySession` (on-device) → Swift port of the styliser → in-app gallery. See `docs/PLAN.md` for the 11-task breakdown.
+- [x] Python engine — faceted default, gallery, phone viewer
+- [x] Portable **C/C++ styliser core** (`kat/core/`) — verified against the Python reference on 4 models
+- [ ] Swift wrapper + iOS capture app: `ObjectCaptureSession` → `PhotogrammetrySession` (on-device) → core → in-app gallery. See `docs/PLAN.md` for the 11-task breakdown.
 
 ## Notes
 

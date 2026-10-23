@@ -22,3 +22,7 @@ cache/
 # secrets / local
 .env
 *.local
+
+# compiled core binary + python cache
+kat/core/katamari
+kat/core/__pycache__/
