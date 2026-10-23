@@ -1,0 +1,24 @@
+# environments
+.venv/
+.venv-*/
+venv/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# third-party model assets (do not redistribute) and generated outputs
+kat/src/
+kat/*.glb
+kat/tex/
+kat/out/
+kat/library/models/
+kat/library/thumbs/
+kat/library_preview.png
+cache/
+
+# secrets / local
+.env
+*.local

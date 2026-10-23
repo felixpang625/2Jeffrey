@@ -1,0 +1,8 @@
+numpy
+trimesh
+pillow
+rtree
+scipy
+scikit-learn
+fast-simplification
+xatlas

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Katamari Scan Viewer</title>
+<style>
+  html,body{margin:0;height:100%;background:#141418;font-family:-apple-system,system-ui,sans-serif;color:#eee}
+  model-viewer{width:100vw;height:100vh;--poster-color:transparent;background:#141418}
+  #tip{position:fixed;left:0;right:0;bottom:14px;text-align:center;font-size:13px;color:#9aa;pointer-events:none}
+</style>
+<!-- Google's <model-viewer>: renders .glb in Mobile Safari (and any evergreen browser) -->
+<script type="module"
+  src="https://ajax.googleapis.com/ajax/libs/model-viewer/4.4.0/model-viewer.min.js"></script>
+</head>
+<body>
+  <!-- ?src=foo.glb  ->  loads that model. Default is our stylized avocado. -->
+  <model-viewer id="mv" alt="Scanned object" src="Avocado_kat.glb"
+      camera-controls touch-action="pan-y" auto-rotate rotation-per-second="18deg"
+      shadow-intensity="0.9" exposure="1.05" camera-orbit="35deg 70deg auto"
+      environment-image="neutral" ar ar-modes="webxr scene-viewer quick-look">
+    <div id="tip" slot="progress-bar">loading…</div>
+  </model-viewer>
+  <div id="tip">pinch to zoom &middot; drag to rotate &middot; tap AR to place it in your room</div>
+<script>
+  const p = new URLSearchParams(location.search);
+  if (p.get('src')) document.getElementById('mv').src = p.get('src');
+</script>
+</body>
+</html>
