@@ -112,9 +112,124 @@ KatamariScanner/
 (exactly the reference site's experience: thumbnail grid → tap → free-rotate viewer, plus AR placement).
 **Out (deferred):** the "roll objects up into a growing ball" game mechanic.
 
+**Capture mode:** tap-to-select the object in the live camera view (ARKit raycast + LiDAR
+depth + Vision instance mask) feeding our own `PhotogrammetrySession`, instead of relying on
+`ObjectCaptureSession`'s auto-detected bounding box. This **replaces Tasks 1-3** with
+Tasks 11-15 — see "Capture UX: tap-to-select the object" below for why and how.
+
 This makes Task 10 (Viewer + Gallery) a first-class deliverable, and Task 9's export must include `.usdz`
 for native iOS viewing. A working web gallery already exists at `kat/library/` (see below) and is the
 running reference for what the in-app gallery must do.
+
+---
+
+## Capture UX: tap-to-select the object
+
+**Requested:** instead of inferring the object from a distance/bounding-box heuristic (as
+Scaniverse does), let the user **tap the object in the live camera view** and scan *that*
+object - the way you tap to focus.
+
+### Correction to the mental model
+
+`AVCaptureDevice.focusPointOfInterest` is a **lens** operation: it meters autofocus at a 2D
+point and returns no depth, no extent, no object identity. The interaction metaphor is right,
+but the mechanism cannot be focus. It has to be **depth + segmentation**.
+
+### Building blocks (all shipped by Apple)
+
+| Need | API | Since |
+|---|---|---|
+| Tap -> 3D point in the world | `ARSession.raycast(_:)` / `ARFrame.raycastQuery(from:allowing:alignment:)` | iOS 11 |
+| Real metric distance to the tapped pixel | `ARFrame.sceneDepth` (`ARDepthData.depthMap`, LiDAR) | iOS 14 |
+| "Which pixels are the object" | `VNGenerateForegroundInstanceMaskRequest` -> `VNInstanceMaskObservation` | iOS 17 |
+| Reconstruct **only** that object | `PhotogrammetrySample.objectMask` | iOS 17 |
+| Feed our own images to reconstruction | `PhotogrammetrySession(input: <sequence of PhotogrammetrySample>)` | iOS 17 |
+
+The last two are the unlock. `PhotogrammetrySample` carries `image`, **`objectMask`**,
+`depthDataMap`, `depthConfidenceMap`, `gravity`, `camera` and `boundingBox`.
+`ObjectCaptureSession` sets that mask for you; in a custom capture loop **we set it ourselves
+from the tap**.
+
+### Two paths - and why this feature forces Path B
+
+- **Path A - `ObjectCaptureSession`:** Apple auto-detects the bounding box
+  (`startDetecting()` / `resetDetection()`) and exposes **no API to set the box manually**.
+  Hands-off, less code, but tap-to-select is impossible.
+- **Path B - ARKit + Vision + `PhotogrammetrySession`:** we own the box and the mask. More
+  code, but every piece is a documented API. **This is what the requested UX requires.**
+
+### Stage 1 - tap -> 3D box -> guided orbit
+
+```swift
+// AR session with LiDAR depth (capability-gated)
+let config = ARWorldTrackingConfiguration()
+config.planeDetection = [.horizontal, .vertical]
+if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+    config.frameSemantics.insert(.sceneDepth)          // also .smoothedSceneDepth
+}
+session.run(config)
+
+// tap -> 3D point + true distance
+func handleTap(_ p: CGPoint, frame: ARFrame, viewSize: CGSize) {
+    guard let q = frame.raycastQuery(from: p, allowing: .estimatedPlane, alignment: .any),
+          let hit = session.raycast(q).first else { return }
+    let world = SIMD3<Float>(hit.worldTransform.columns.3.x,
+                             hit.worldTransform.columns.3.y,
+                             hit.worldTransform.columns.3.z)
+    let meters = frame.sceneDepth.flatMap {
+        depthValue(at: p, depthMap: $0.depthMap, frame: frame, viewSize: viewSize)
+    }
+    // -> place an AR box (edge ~ estimated object size) centred at `world`
+}
+```
+
+`depthValue` must map the screen point through the camera image->view transform
+(`frame.displayTransform(for:viewportSize:)`) and then through the camera intrinsics to a
+depth-map pixel. The depth map is low resolution (~256x192), so sample a small neighbourhood
+and take the median. **Verify the exact transform on device - this is the fiddliest part.**
+
+### Stage 2 - mask the tapped object into reconstruction
+
+```swift
+// 1. instance mask; pick the instance under the tap
+let req = VNGenerateForegroundInstanceMaskRequest()
+let handler = VNImageRequestHandler(cvPixelBuffer: frame.capturedImage, orientation: .right)
+try handler.perform([req])
+guard let obs = req.results?.first else { return }
+let instanceIDs = instanceIDsUnderTap(p, obs, handler)          // from the tap point
+let mask = try obs.generateScaledMaskForImage(forInstances: instanceIDs, from: handler)
+
+// 2. one sample per captured frame
+var sample = PhotogrammetrySample(id: nextID, image: frame.capturedImage)
+sample.objectMask         = mask
+sample.depthDataMap       = frame.sceneDepth?.depthMap
+sample.depthConfidenceMap = frame.sceneDepth?.confidenceMap
+sample.boundingBox        = boxTransform            // simd_float4x4: unit cube -> object box
+sample.gravity            = motion.gravity          // CMAcceleration
+sample.sessionID          = captureSessionID        // SAME UUID for all samples
+samples.append(sample)
+
+// 3. reconstruct
+let ps = try PhotogrammetrySession(input: samples, configuration: cfg)
+try ps.process(requests: [.modelFile(url: out, detail: .reduced)])
+```
+
+Notes:
+- `id` must be in `[0, 2147483647]`.
+- Set `sessionID` to one UUID for the whole capture so `boundingBox`/poses share a coordinate system.
+- `image` and `id` are `let`; the rest are `var`.
+- `objectMask` should match the image's pixel dimensions (`generateScaledMaskForImage` gives that).
+
+### Caveats
+
+1. **You still orbit the object.** Photogrammetry needs multi-view; tap-select constrains
+   *what* is reconstructed, not whether you walk around it.
+2. **LiDAR depth is coarse** (~256x192, ~1 cm near, degrading with distance) - reliable at
+   20 cm-1 m, poor on tiny or glossy objects.
+3. **Masks are 2D.** Mask + depth yields a noisy volume: fit a box with margin, not a hull.
+4. **Depth-map vs image resolution mismatch** - confirm on device what `PhotogrammetrySample` expects.
+5. **Non-LiDAR fallback:** dual-camera `AVDepthData` or a monocular depth model;
+   `supportsFrameSemantics(.sceneDepth)` gates the good path.
 
 ---
 
@@ -224,6 +339,28 @@ func loadMesh(_ url: URL, device: MTLDevice) throws -> MappedMesh { /* MDLAsset 
 ```
 
 **Verify:** print vertex/face counts; the counts should roughly match a `usdz` inspection of the same file.
+
+---
+
+## Task 5: Simplify + posterise — ALREADY DONE as a C core
+
+**UPDATE: this is no longer a Swift port.** `kat/core/` implements decimate + per-face colour
++ k-means posterise as portable C/C++ using meshoptimizer, and it is **verified against the
+Python reference** on 4 models (`kat/core/test_core.py`; the core hits the target triangle
+count exactly, 199-200 for a target of 200, with 12-colour palettes).
+
+Because `meshopt_simplify` collapses edges into **existing** vertices, surviving vertices keep
+their original UVs, so colours are sampled directly rather than projected back onto the source
+mesh. **This makes the black-shard artifact class structurally impossible.**
+
+What remains on iOS is only to *wrap* it:
+1. Add `kat/core/` as a C/C++ target (SwiftPM `target` or Xcode group).
+2. Add `MeshOptimizer-Bridging-Header.h` exposing `katamari_core.h`.
+3. Call `katamari_stylize(positions, faces, vcols, targetTris, paletteK, faceted)`.
+
+**Tasks 6, 7 and 8 below are therefore superseded** - they describe the Python-era plan to
+re-implement colour sampling, palette quantisation and atlas building in Swift. The core does
+all three. Keep them only as reference for the colour/atlas reasoning.
 
 ---
 
@@ -358,6 +495,20 @@ Also set `doubleSided` via `PBRMaterial`, not `SimpleMaterial` — the latter si
 - Grid gallery with thumbnails; share sheet for `.glb`/`.usdz`.
 
 **Verify:** kill and relaunch → gallery still populated.
+
+---
+
+## Tasks 11-15: tap-to-select capture (replaces Tasks 1-3)
+
+- **Task 11** - ARKit capture session with `.sceneDepth`, capability gate, live AR view. 📱
+- **Task 12** - tap -> raycast + depth -> 3D box overlay; pinch to resize. 📱
+- **Task 13** - Vision instance mask under the tap; snap the box to the masked instance. 📱
+- **Task 14** - assemble `PhotogrammetrySample`s (mask + depth + bbox + shared `sessionID`)
+  and drive `PhotogrammetrySession`. 📱
+- **Task 15** - coverage guidance (how much of the object has been seen) + capture-dial UI. 📱
+
+Stage 1 = Tasks 11-12 (usable on its own, better than a distance guess).
+Stage 2 = Tasks 13-14 (the "tap the object and scan *it*" behaviour lands here).
 
 ---
 
